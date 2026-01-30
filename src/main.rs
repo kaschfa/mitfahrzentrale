@@ -1,3 +1,4 @@
+use axum::extract::Path;
 use axum::{Json, Router, extract::State, routing::get};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -34,7 +35,8 @@ async fn main() -> Result<(), sqlx::Error> {
         .await?;
 
     let app = Router::new()
-        .route("/", get(list_entries))
+        .route("/entries", get(list_entries))
+        .route("/entries/{id}", get(get_entry_by_id))
         .route("/users", get(list_users))
         .with_state(AppState { pool });
 
@@ -84,4 +86,23 @@ async fn list_users(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(users))
+}
+
+async fn get_entry_by_id(
+    Path(id): Path<i32>,
+    State(state): State<AppState>,
+) -> Result<Json<Entry>, (axum::http::StatusCode, String)> {
+    let entry = sqlx::query_as::<_, Entry>(
+        r#"
+            SELECT id, titel, nachricht, typ, sitzplaetze
+            FROM eintrag
+            WHERE id=$1
+            "#,
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(entry))
 }
