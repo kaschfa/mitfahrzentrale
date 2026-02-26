@@ -19,13 +19,11 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    // token -> last activity
-    sessions: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, FromRow)]
 struct Entry {
-    id: i32,
+    id: i64,
     titel: String,
     nachricht: String,
     typ: String,
@@ -60,16 +58,14 @@ struct EntryContact {
 async fn main() -> Result<(), sqlx::Error> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect("postgres://app:app@localhost:5432/app_db")
+        .connect("postgres://student_user:strong_password@static.170.127.180.157.clients.your-server.de:80/mitfahrzentrale_db")
         .await?;
 
     let state = AppState {
         pool,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
-        .route("/login/{token}", post(login_with_token))
         .route("/users", get(list_users))
         .route("/entries/{id}", get(get_entry_by_id))
         .route("/entries/{id}/contact", get(get_entry_contact))
@@ -81,98 +77,6 @@ async fn main() -> Result<(), sqlx::Error> {
 
     Ok(())
 }
-
-// ---------- AUTH HELPERS ----------
-
-fn read_bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing Authorization header".to_string(),
-        ))?;
-
-    let token = auth
-        .strip_prefix("Bearer ")
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Expected: Bearer <token>".to_string(),
-        ))?
-        .trim();
-
-    if token.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "Empty token".to_string()));
-    }
-
-    Ok(token)
-}
-
-async fn token_exists(pool: &PgPool, token: &str) -> Result<bool, sqlx::Error> {
-    let (exists,) =
-        sqlx::query_as::<_, (bool,)>(r#"SELECT EXISTS(SELECT 1 FROM schueler WHERE token = $1)"#)
-            .bind(token)
-            .fetch_one(pool)
-            .await?;
-
-    Ok(exists)
-}
-
-/// Requires that:
-/// 1) token is present in memory (user called /login/{token})
-/// 2) last activity is not older than 10 minutes
-/// Then it "touches" (refreshes) activity time.
-async fn require_logged_in_and_touch(
-    state: &AppState,
-    token: &str,
-) -> Result<(), (StatusCode, String)> {
-    let idle_limit = Duration::from_secs(10 * 60);
-
-    let mut sessions = state.sessions.write().await;
-
-    let last = sessions.get(token).copied().ok_or((
-        StatusCode::UNAUTHORIZED,
-        "Not logged in. Call POST /login/{token}".to_string(),
-    ))?;
-
-    if last.elapsed() > idle_limit {
-        sessions.remove(token); // expire session
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Session expired (idle > 10 min). Call POST /login/{token} again.".to_string(),
-        ));
-    }
-
-    // touch
-    sessions.insert(token.to_string(), Instant::now());
-    Ok(())
-}
-
-// ---------- LOGIN ENDPOINT ----------
-
-async fn login_with_token(
-    Path(token): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // 1) token must exist in DB
-    let exists = token_exists(&state.pool, &token)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if !exists {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
-    }
-
-    // 2) mark as logged in (start session)
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(token, Instant::now());
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-// ---------- DB QUERIES ----------
 
 async fn get_all_entries(pool: &sqlx::PgPool) -> Result<Vec<Entry>, sqlx::Error> {
     sqlx::query_as::<_, Entry>(
@@ -212,10 +116,6 @@ async fn list_users(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<User>>, (StatusCode, String)> {
-    let token = read_bearer_token(&headers)?;
-
-    // must have called /login/{token} and be active within 10 min
-    require_logged_in_and_touch(&state, token).await?;
 
     let users = get_all_users(&state.pool)
         .await
@@ -229,8 +129,6 @@ async fn get_entry_by_id(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Entry>, (StatusCode, String)> {
-    let token = read_bearer_token(&headers)?;
-    require_logged_in_and_touch(&state, token).await?;
 
     let entry = sqlx::query_as::<_, Entry>(
         r#"
@@ -252,8 +150,6 @@ async fn get_entry_contact(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<EntryContact>, (StatusCode, String)> {
-    let token = read_bearer_token(&headers)?;
-    require_logged_in_and_touch(&state, token).await?;
 
     let contact = sqlx::query_as::<_, EntryContact>(
         r#"
@@ -280,7 +176,6 @@ fn validate_entry_payload(p: &NewEntry) -> Result<(), (StatusCode, String)> {
         ));
     }
 
-    // Capacity rule
     match p.typ.as_str() {
         "Angebot" => {
             if p.sitzplaetze <= 0 {
@@ -291,7 +186,6 @@ fn validate_entry_payload(p: &NewEntry) -> Result<(), (StatusCode, String)> {
             }
         }
         "Anfrage" => {
-            // no special requirement
         }
         _ => {
             return Err((
@@ -301,7 +195,6 @@ fn validate_entry_payload(p: &NewEntry) -> Result<(), (StatusCode, String)> {
         }
     }
 
-    // optional: basic checks
     if p.titel.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -323,20 +216,13 @@ async fn create_entry(
     State(state): State<AppState>,
     Json(payload): Json<NewEntry>,
 ) -> Result<(StatusCode, Json<Entry>), (StatusCode, String)> {
-    // Token-check: must be logged in + not idle
-    let token = read_bearer_token(&headers)?;
-    let user = get_user_by_token(token, &state.pool).await.unwrap();
-    require_logged_in_and_touch(&state, token).await?;
 
-    // Business validation
     validate_entry_payload(&payload)?;
 
-    // Insert into DB
-    // NOTE: adjust columns if your eintrag table differs (e.g. schueler_id)
     let inserted = sqlx::query_as::<_, Entry>(
         r#"
         INSERT INTO eintrag (titel, nachricht, typ, sitzplaetze, schueler_id)
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $2, $3, $4)
         RETURNING id, titel, nachricht, typ, sitzplaetze
         "#,
     )
@@ -344,7 +230,7 @@ async fn create_entry(
     .bind(payload.nachricht)
     .bind(payload.typ)
     .bind(payload.sitzplaetze)
-    .bind(user.id)
+    //.bind(user.id)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
